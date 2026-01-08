@@ -1,0 +1,36 @@
+# Ignore test files
+tests/
+test/
+
+# Ignore archived files
+archive/
+
+# Ignore development files
+*.md
+!README.md
+Spec.md
+devguide.md
+CLAUDE.md
+.git/
+.gitignore
+.env
+.vscode/
+.claude/
+
+# Ignore node modules (will be installed in Docker)
+node_modules/
+
+# Ignore Apify storage
+apify_storage/
+storage/
+
+# Ignore logs
+*.log
+logs/
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore implementation plan
+IMPLEMENTATION_PLAN.md

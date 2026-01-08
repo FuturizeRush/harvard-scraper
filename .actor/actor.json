@@ -1,0 +1,39 @@
+{
+    "actorSpecification": 1,
+    "name": "harvard-catalyst-profiles-scraper",
+    "version": "0.0",
+    "buildTag": "latest",
+    "timeoutSecs": 0,
+    "minMemoryMbytes": 512,
+    "maxMemoryMbytes": 4096,
+    "environmentVariables": {},
+    "usesStandbyMode": false,
+    "dockerfile": "./Dockerfile",
+    "readme": "./README.md",
+    "input": "./input_schema.json",
+    "storages": {
+        "dataset": {
+            "actorSpecification": 1,
+            "fields": {},
+            "views": {
+                "overview": {
+                    "title": "Overview",
+                    "transformation": {
+                        "fields": [
+                            "displayName",
+                            "title",
+                            "institution",
+                            "department",
+                            "email",
+                            "profileUrl"
+                        ]
+                    },
+                    "display": {
+                        "component": "table",
+                        "properties": {}
+                    }
+                }
+            }
+        }
+    }
+}

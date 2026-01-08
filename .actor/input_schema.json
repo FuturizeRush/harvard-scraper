@@ -1,0 +1,43 @@
+{
+    "title": "Input schema for Harvard Catalyst Profiles Scraper",
+    "description": "Scrape profiles from Harvard Catalyst Profiles directory with optional filters",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "searchKeywords": {
+            "title": "Search Keywords",
+            "type": "string",
+            "description": "Keywords to search for in profiles (e.g., 'cancer research', 'neuroscience'). Leave empty to get all profiles.",
+            "editor": "textfield",
+            "default": "",
+            "prefill": ""
+        },
+        "department": {
+            "title": "Department",
+            "type": "string",
+            "description": "Filter by department name (optional)",
+            "editor": "textfield",
+            "default": "",
+            "prefill": ""
+        },
+        "institution": {
+            "title": "Institution",
+            "type": "string",
+            "description": "Filter by institution name (optional)",
+            "editor": "textfield",
+            "default": "",
+            "prefill": ""
+        },
+        "maxItems": {
+            "title": "Maximum Items",
+            "type": "integer",
+            "description": "Maximum number of profiles to scrape (50-30000). Each run is independent.",
+            "editor": "number",
+            "default": 50,
+            "minimum": 50,
+            "maximum": 30000,
+            "prefill": 50
+        }
+    },
+    "required": []
+}
