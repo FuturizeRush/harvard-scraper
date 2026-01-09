@@ -151,6 +151,11 @@ async function extractProfileDetails(page) {
                 // These are invalid in JSON: \' should just be '
                 jsonStr = jsonStr.replace(/\'/g, "'");
 
+                // FIX: Clean up invalid escape sequences that break JSON.parse
+                // Some profiles contain backslashes not meant for escaping (e.g. paths, typos)
+                // We remove backslashes that are NOT followed by valid JSON escape chars
+                jsonStr = jsonStr.replace(/\\(?!["\\/bfnrtu])/g, "");
+
                 // Parse the JSON
                 let parsed;
                 try {
