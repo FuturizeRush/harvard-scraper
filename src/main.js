@@ -74,8 +74,8 @@ const { StateManager } = require('./lib/state-manager.js');
                 useFingerprints: false,
                 maxOpenPagesPerBrowser: 1
             },
-            requestHandlerTimeoutSecs: 60,
-            navigationTimeoutSecs: 30,
+            requestHandlerTimeoutSecs: 90,
+            navigationTimeoutSecs: 60,
 
             async requestHandler({ request, page }) {
                 const { profile } = request.userData;
