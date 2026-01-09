@@ -30,19 +30,20 @@ function sanitizeInput(input) {
  */
 async function searchProfiles({ keyword, department, institution, maxItems }) {
     const profiles = [];
-    const pageSize = 10; // API default
+    const pageSize = 100; // Increased from 10 for faster API collection
     let offset = 1;
     let totalAvailable = null;
     let emptyPagesCount = 0;
     let consecutiveFailures = 0;
-    const MAX_EMPTY_PAGES = 5; // Stop after 5 consecutive empty pages
+    const MAX_EMPTY_PAGES = 3; // Stop after 3 consecutive empty pages
+    const API_DELAY = 50; // Fast delay for API (no anti-bot needed)
 
     // Sanitize all user inputs
     const safeKeyword = sanitizeInput(keyword || '');
     const safeDepartment = sanitizeInput(department || '');
     const safeInstitution = sanitizeInput(institution || '');
 
-    console.log(`🔎 Searching for researchers...`);
+    console.log(`🔎 Searching for researchers (${pageSize} per page)...`);
 
     while (profiles.length < maxItems) {
         try {
@@ -122,14 +123,12 @@ async function searchProfiles({ keyword, department, institution, maxItems }) {
 
                 // Skip this empty page and try next offset
                 offset += pageSize;
-                await new Promise(resolve => setTimeout(resolve, 200));
+                await new Promise(resolve => setTimeout(resolve, API_DELAY));
                 continue;
             }
 
             // Reset empty pages counter on successful page
             emptyPagesCount = 0;
-
-            console.log(`📊 Progress: Found ${profiles.length + data.People.length} / ${totalAvailable || '?'} researchers`);
 
             // Process profiles
             for (const item of data.People) {
@@ -158,8 +157,14 @@ async function searchProfiles({ keyword, department, institution, maxItems }) {
 
             offset += pageSize;
 
-            // Rate limiting (reduced for faster collection)
-            await new Promise(resolve => setTimeout(resolve, 200));
+            // Minimal delay for API (no anti-bot protection)
+            await new Promise(resolve => setTimeout(resolve, API_DELAY));
+
+            // Progress log every 500 profiles
+            if (profiles.length % 500 === 0 && profiles.length > 0) {
+                const percent = totalAvailable ? Math.round(profiles.length / totalAvailable * 100) : '?';
+                console.log(`   📈 ${profiles.length} collected (${percent}%)`);
+            }
 
         } catch (error) {
             console.error(`⚠️  Failed to fetch page at offset ${offset}: ${error.message}`);
