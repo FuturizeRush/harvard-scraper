@@ -46,6 +46,17 @@ async function extractProfileDetails(page) {
         // Wait for DOM content to be loaded
         await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
 
+        // FAIL FAST: Check for blank/blocked page immediately
+        const pageStatus = await page.evaluate(() => ({
+            title: document.title,
+            bodyLength: document.body.innerText.length,
+            hasContent: document.body.innerHTML.length > 50
+        }));
+
+        if (!pageStatus.title && pageStatus.bodyLength < 50) {
+            throw new Error('Blocked or Empty Page detected (Title empty, Body empty). triggering session rotation.');
+        }
+
         // Wait for g.preLoad script to be available with increased timeout
         // Some profiles need more time to fully render.
         // If not found, try reloading the page up to 2 times.

@@ -71,8 +71,9 @@ const { StateManager } = require('./lib/state-manager.js');
                 }
             },
             browserPoolOptions: {
-                useFingerprints: false,
-                maxOpenPagesPerBrowser: 1
+                useFingerprints: true,
+                maxOpenPagesPerBrowser: 1,
+                retireBrowserAfterPageCount: 10
             },
             requestHandlerTimeoutSecs: 90,
             navigationTimeoutSecs: 60,
