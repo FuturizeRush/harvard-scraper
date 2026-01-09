@@ -74,7 +74,8 @@ const { StateManager } = require('./lib/state-manager.js');
                 useFingerprints: false,
                 maxOpenPagesPerBrowser: 1
             },
-            requestHandlerTimeoutSecs: 180,
+            requestHandlerTimeoutSecs: 60,
+            navigationTimeoutSecs: 30,
 
             async requestHandler({ request, page }) {
                 const { profile } = request.userData;
@@ -169,6 +170,14 @@ const { StateManager } = require('./lib/state-manager.js');
                 } catch (error) {
                     console.error(`❌ Error processing ${profile.displayName} (ID: ${profile.personId}): ${error.message}`);
 
+                    // If we haven't exhausted retries, throw the error to let Crawlee retry
+                    // Default maxRequestRetries is 3. So retryCount 0, 1, 2.
+                    if (request.retryCount < 3 &&
+                        (error.message.includes('g.preLoad') || error.message.includes('Timeout') || error.message.includes('Extraction failed'))) {
+                        console.log(`🔄 Retrying ${profile.displayName} (Attempt ${request.retryCount + 1}/3)...`);
+                        throw error;
+                    }
+
                     // Save partial data even on failure (with personId for tracking)
                     const partialData = {
                         // Ensure personId is preserved for deduplication
@@ -195,7 +204,7 @@ const { StateManager } = require('./lib/state-manager.js');
                     };
 
                     await Actor.pushData(partialData);
-                    console.log(`⚠️  Partial data saved: ${profile.displayName}`);
+                    console.log(`⚠️  Partial data saved: ${profile.displayName} (Retries exhausted)`);
 
                     // Mark as processed even on error to avoid infinite retry
                     stateManager.markProcessed(profile.personId);
@@ -212,13 +221,27 @@ const { StateManager } = require('./lib/state-manager.js');
             }
         });
 
-        // Queue all profile detail pages
-        for (const profile of profiles) {
-            await crawler.addRequests([{
+        // Save search results immediately to prevent data loss on crash
+        await Actor.setValue('SEARCH_DUMP', profiles);
+        console.log(`💾 Saved ${profiles.length} profiles to intermediate storage (SEARCH_DUMP)`);
+
+        // Queue all profile detail pages in batches to prevent event loop blocking
+        console.log('🔄 Adding profiles to request queue...');
+        const BATCH_SIZE = 1000;
+        for (let i = 0; i < profiles.length; i += BATCH_SIZE) {
+            const batch = profiles.slice(i, i + BATCH_SIZE);
+            const requests = batch.map(profile => ({
                 url: profile.profileUrl,
                 userData: { profile }
-            }]);
+            }));
+            await crawler.addRequests(requests);
+            if (i % 5000 === 0 && i > 0) console.log(`   - Queued ${i} / ${profiles.length}`);
         }
+        console.log('✅ All profiles queued for processing');
+
+        // Free up memory
+        const profilesCount = profiles.length;
+        profiles = null;
 
         // Run the crawler
         await crawler.run();
@@ -241,8 +264,15 @@ const { StateManager } = require('./lib/state-manager.js');
         console.log(`      - Processed: ${processedCount} profiles`);
         console.log(`      - Successfully saved: ${newItemsCollected} profiles`);
         console.log(`      - Total items now: ${finalInfo.itemCount}`);
-        console.log(`   🔍 Researchers found: ${profiles.length}`);
-        console.log(`   ✨ Success rate: ${Math.round((newItemsCollected / profiles.length) * 100)}%`);
+        
+        // Use profilesCount which was saved before profiles was set to null
+        const safeProfilesCount = profilesCount || 0;
+        console.log(`   🔍 Researchers found: ${safeProfilesCount}`);
+        
+        const successRate = safeProfilesCount > 0 
+            ? Math.round((newItemsCollected / safeProfilesCount) * 100) 
+            : 0;
+        console.log(`   ✨ Success rate: ${successRate}%`);
         console.log(`   ⏱️  Total processing rate: ${stats.ratePerMinute} profiles/min`);
 
         // Warning if there's a mismatch
