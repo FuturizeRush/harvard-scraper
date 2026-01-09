@@ -1,14 +1,28 @@
 /**
  * Harvard Catalyst Profiles Scraper
  * Two-stage scraper: API for listings + Browser for detail enrichment
+ *
+ * OPTIMIZATION v2.0:
+ * - Batch processing to prevent memory overflow
+ * - Longer delays to avoid anti-bot detection
+ * - Periodic browser restart for memory cleanup
+ * - Checkpoint resume support
  */
 
 const { Actor } = require('apify');
-const { PlaywrightCrawler } = require('crawlee');
+const { PlaywrightCrawler, Configuration } = require('crawlee');
 const { searchProfiles } = require('./lib/api.js');
 const { extractProfileDetails } = require('./lib/extractor.js');
-const { performOCR } = require('./lib/ocr.js');
+const { performOCR, terminateWorker } = require('./lib/ocr.js');
 const { StateManager } = require('./lib/state-manager.js');
+
+// Configuration constants
+const BATCH_SIZE = 200; // Process profiles in batches
+const DELAY_BETWEEN_REQUESTS_MIN = 4000; // 4 seconds minimum
+const DELAY_BETWEEN_REQUESTS_MAX = 8000; // 8 seconds maximum
+const DELAY_BETWEEN_BATCHES = 30000; // 30 seconds between batches
+const BROWSER_RESTART_INTERVAL = 50; // Restart browser every 50 profiles
+const CHECKPOINT_INTERVAL = 25; // Save state every 25 profiles
 
 (async () => {
     try {
@@ -22,8 +36,9 @@ const { StateManager } = require('./lib/state-manager.js');
             maxItems = 50
         } = input;
 
-        console.log('🔍 Harvard Catalyst Profiles Scraper started');
-        console.log(`📋 Search criteria: Keywords="${searchKeywords}", Department="${department}", Institution="${institution}", Max profiles=${maxItems}`);
+        console.log('🔍 Harvard Catalyst Profiles Scraper started (Optimized v2.0)');
+        console.log(`📋 Search: Keywords="${searchKeywords}", Department="${department}", Institution="${institution}"`);
+        console.log(`📊 Target: ${maxItems} profiles`);
 
         // Ensure dataset is ready
         const dataset = await Actor.openDataset();
@@ -33,282 +48,304 @@ const { StateManager } = require('./lib/state-manager.js');
         // Initialize state manager for progress tracking
         const stateManager = new StateManager();
         const searchParams = { searchKeywords, department, institution };
-        await stateManager.initialize(searchParams, maxItems);
+        const isResumed = await stateManager.initialize(searchParams, maxItems);
 
         // ========== STAGE 1: API-based listing extraction ==========
         console.log('\n📋 Searching for researcher profiles...');
 
         let profiles = [];
         try {
-            profiles = await searchProfiles({
-                keyword: searchKeywords,
-                department,
-                institution,
-                maxItems
-            });
+            // Check if we have cached search results
+            const cachedProfiles = await Actor.getValue('SEARCH_DUMP');
+            if (cachedProfiles && cachedProfiles.length > 0 && isResumed) {
+                profiles = cachedProfiles;
+                console.log(`♻️  Using cached search results: ${profiles.length} profiles`);
+            } else {
+                profiles = await searchProfiles({
+                    keyword: searchKeywords,
+                    department,
+                    institution,
+                    maxItems
+                });
+                // Save search results for resume
+                await Actor.setValue('SEARCH_DUMP', profiles);
+                console.log(`💾 Saved ${profiles.length} profiles to cache`);
+            }
 
             console.log(`✅ Found ${profiles.length} researchers matching your criteria`);
-            console.log(`📝 Will process ${profiles.length} profiles`);
         } catch (error) {
             console.error(`❌ Search failed: ${error.message}`);
-            console.error('Error details:', error);
             await Actor.exit({ exitCode: 1 });
             return;
         }
 
-        // ========== STAGE 2: Browser-based detail enrichment ==========
-        console.log(`\n📝 Collecting detailed information for ${profiles.length} researchers...`);
+        // Filter out already processed profiles
+        const processedIds = stateManager.getProcessedIds();
+        const remainingProfiles = profiles.filter(p => !processedIds.has(p.personId));
+        console.log(`📝 Remaining profiles to process: ${remainingProfiles.length}`);
 
-        // Report dataset status before starting
-        const preProcessingInfo = await dataset.getInfo();
-        console.log(`📊 Dataset before processing: ${preProcessingInfo.itemCount} items`);
+        if (remainingProfiles.length === 0) {
+            console.log('✅ All profiles already processed!');
+            await Actor.exit();
+            return;
+        }
 
-        const crawler = new PlaywrightCrawler({
-            maxConcurrency: 1,
-            launchContext: {
-                launchOptions: {
-                    headless: true
-                }
-            },
-            browserPoolOptions: {
-                useFingerprints: true,
-                maxOpenPagesPerBrowser: 1,
-                retireBrowserAfterPageCount: 10
-            },
-            requestHandlerTimeoutSecs: 90,
-            navigationTimeoutSecs: 60,
-            
-            preNavigationHooks: [
-                async ({ page, log }) => {
-                    // Anti-blocking: Random delay between requests (2-5 seconds)
-                    const delay = Math.floor(Math.random() * 3000) + 2000;
-                    log.info(`💤 Sleeping for ${delay}ms to avoid blocking...`);
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                }
-            ],
+        // ========== STAGE 2: Browser-based detail enrichment (Batch Processing) ==========
+        console.log(`\n📝 Starting batch processing...`);
+        console.log(`   Batch size: ${BATCH_SIZE}`);
+        console.log(`   Total batches: ${Math.ceil(remainingProfiles.length / BATCH_SIZE)}`);
 
-            async requestHandler({ request, page }) {
-                const { profile } = request.userData;
-                console.log(`📄 Collecting profile: ${profile.displayName} (ID: ${profile.personId})`);
+        let totalProcessed = 0;
+        let totalErrors = 0;
+        let profilesInCurrentBatch = 0;
 
-                // Check if already processed (prevent duplicates)
-                if (stateManager.isProcessed(profile.personId)) {
-                    console.log(`⏭️  Skipping ${profile.displayName} - already processed`);
-                    return;
-                }
+        // Process in batches
+        for (let batchIndex = 0; batchIndex < Math.ceil(remainingProfiles.length / BATCH_SIZE); batchIndex++) {
+            const batchStart = batchIndex * BATCH_SIZE;
+            const batchEnd = Math.min(batchStart + BATCH_SIZE, remainingProfiles.length);
+            const batchProfiles = remainingProfiles.slice(batchStart, batchEnd);
+            profilesInCurrentBatch = 0;
 
-                try {
-                    // Set English language
-                    await page.setExtraHTTPHeaders({
-                        'Accept-Language': 'en-US,en;q=0.9'
-                    });
+            console.log(`\n🔄 Processing batch ${batchIndex + 1}/${Math.ceil(remainingProfiles.length / BATCH_SIZE)}`);
+            console.log(`   Profiles ${batchStart + 1} to ${batchEnd} of ${remainingProfiles.length}`);
 
-                    // Extract profile details (uses g.preLoad)
-                    const result = await extractProfileDetails(page);
-
-                    if (!result.success) {
-                        throw new Error(result.error || 'Extraction failed');
+            // Create fresh crawler for each batch to prevent memory buildup
+            const crawler = new PlaywrightCrawler({
+                maxConcurrency: 1, // Single request at a time for stability
+                launchContext: {
+                    launchOptions: {
+                        headless: true,
+                        args: [
+                            '--disable-dev-shm-usage',
+                            '--no-sandbox',
+                            '--disable-setuid-sandbox',
+                            '--disable-gpu',
+                            '--disable-extensions',
+                            '--disable-background-networking',
+                            '--disable-default-apps',
+                            '--disable-sync',
+                            '--disable-translate',
+                            '--metrics-recording-only',
+                            '--mute-audio',
+                            '--no-first-run',
+                            '--safebrowsing-disable-auto-update'
+                        ]
                     }
-
-                    // Extract email if image present and no direct email
-                    let extractedEmail = result.Email;
-                    if (!extractedEmail && result.EmailImageUrl) {
-                        try {
-                            console.log(`📧 Extracting email address...`);
-                            extractedEmail = await performOCR(result.EmailImageUrl);
-                            if (extractedEmail) {
-                                console.log(`✅ Email found: ${extractedEmail}`);
-                            } else {
-                                console.log(`ℹ️  Email not found in profile`);
+                },
+                browserPoolOptions: {
+                    useFingerprints: true,
+                    maxOpenPagesPerBrowser: 1,
+                    retireBrowserAfterPageCount: BROWSER_RESTART_INTERVAL,
+                    preLaunchHooks: [
+                        async () => {
+                            // Force garbage collection before launching new browser
+                            if (global.gc) {
+                                global.gc();
                             }
-                        } catch (ocrError) {
-                            console.log(`⚠️  Unable to extract email: ${ocrError.message}`);
                         }
+                    ]
+                },
+                requestHandlerTimeoutSecs: 120,
+                navigationTimeoutSecs: 90,
+                maxRequestRetries: 2, // Reduced retries
+
+                preNavigationHooks: [
+                    async ({ page, log }) => {
+                        // Random delay between requests (4-8 seconds)
+                        const delay = Math.floor(Math.random() * (DELAY_BETWEEN_REQUESTS_MAX - DELAY_BETWEEN_REQUESTS_MIN)) + DELAY_BETWEEN_REQUESTS_MIN;
+                        log.info(`💤 Waiting ${(delay / 1000).toFixed(1)}s...`);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    }
+                ],
+
+                async requestHandler({ request, page }) {
+                    const { profile } = request.userData;
+                    console.log(`📄 [${totalProcessed + 1}] ${profile.displayName}`);
+
+                    // Double-check if already processed
+                    if (stateManager.isProcessed(profile.personId)) {
+                        console.log(`⏭️  Skipping - already processed`);
+                        return;
                     }
 
-                    // Combine listing and detail data (merge enrichment)
-                    const enrichedProfile = {
-                        // Unique identifier (prevents duplicates)
-                        personId: profile.personId,
-                        profileUrl: profile.profileUrl,
-
-                        // From detail page extraction (enriched data)
-                        displayName: result.DisplayName || profile.displayName,
-                        firstName: result.FirstName,
-                        lastName: result.LastName,
-                        title: result.Title,
-                        institution: result.Institution || profile.institutionName,
-                        department: result.Department || profile.departmentName,
-                        facultyRank: profile.facultyRank,
-                        address: result.Address,
-                        phone: result.Phone,
-                        fax: result.Fax,
-                        email: extractedEmail || '',
-
-                        // Metadata
-                        collectedAt: new Date().toISOString(),
-                        query: {
-                            searchKeywords,
-                            department,
-                            institution
-                        }
-                    };
-
-                    // Verify enrichment worked (detail data should be present)
-                    const hasEnrichment = result.FirstName || result.LastName || result.Address;
-                    if (!hasEnrichment) {
-                        console.log(`⚠️  Limited detail data for ${profile.displayName}`);
-                    }
-
-                    // Save enriched profile to dataset (only saved ONCE per personId)
                     try {
+                        // Set headers for English content
+                        await page.setExtraHTTPHeaders({
+                            'Accept-Language': 'en-US,en;q=0.9'
+                        });
+
+                        // Extract profile details
+                        const result = await extractProfileDetails(page);
+
+                        if (!result.success) {
+                            throw new Error(result.error || 'Extraction failed');
+                        }
+
+                        // Extract email if image present
+                        let extractedEmail = result.Email;
+                        if (!extractedEmail && result.EmailImageUrl) {
+                            try {
+                                extractedEmail = await performOCR(result.EmailImageUrl);
+                                if (extractedEmail) {
+                                    console.log(`   ✉️  Email: ${extractedEmail}`);
+                                }
+                            } catch (ocrError) {
+                                // Silent OCR failure
+                            }
+                        }
+
+                        // Build enriched profile
+                        const enrichedProfile = {
+                            personId: profile.personId,
+                            profileUrl: profile.profileUrl,
+                            displayName: result.DisplayName || profile.displayName,
+                            firstName: result.FirstName,
+                            lastName: result.LastName,
+                            title: result.Title,
+                            institution: result.Institution || profile.institutionName,
+                            department: result.Department || profile.departmentName,
+                            facultyRank: profile.facultyRank,
+                            address: result.Address,
+                            phone: result.Phone,
+                            fax: result.Fax,
+                            email: extractedEmail || '',
+                            collectedAt: new Date().toISOString(),
+                            query: { searchKeywords, department, institution }
+                        };
+
+                        // Save to dataset
                         await Actor.pushData(enrichedProfile);
-                        console.log(`✅ Saved: ${enrichedProfile.displayName}`);
+                        console.log(`   ✅ Saved`);
 
-                        // Mark as processed only after successful save
+                        // Mark as processed
                         stateManager.markProcessed(profile.personId);
-                    } catch (pushError) {
-                        console.error(`❌ Failed to save ${enrichedProfile.displayName}: ${pushError.message}`);
-                        throw pushError; // Re-throw to trigger partial data save
+                        totalProcessed++;
+                        profilesInCurrentBatch++;
+
+                        // Periodic checkpoint
+                        if (totalProcessed % CHECKPOINT_INTERVAL === 0) {
+                            await stateManager.saveCheckpoint();
+                        }
+
+                    } catch (error) {
+                        console.error(`   ❌ Error: ${error.message}`);
+                        totalErrors++;
+
+                        // Save partial data on error
+                        if (request.retryCount >= 2) {
+                            const partialData = {
+                                personId: profile.personId,
+                                profileUrl: profile.profileUrl,
+                                displayName: profile.displayName,
+                                institution: profile.institutionName,
+                                department: profile.departmentName,
+                                facultyRank: profile.facultyRank,
+                                error: error.message,
+                                isPartial: true,
+                                collectedAt: new Date().toISOString(),
+                                query: { searchKeywords, department, institution }
+                            };
+                            await Actor.pushData(partialData);
+                            stateManager.markProcessed(profile.personId);
+                            totalProcessed++;
+                            profilesInCurrentBatch++;
+                            console.log(`   ⚠️  Saved partial data`);
+                        } else {
+                            throw error; // Let crawler retry
+                        }
                     }
+                },
 
-                    // Save checkpoint periodically
-                    if (stateManager.shouldCheckpoint()) {
-                        await stateManager.saveCheckpoint();
-                    }
+                async failedRequestHandler({ request }, error) {
+                    const { profile } = request.userData;
+                    console.error(`⚠️  Failed after retries: ${profile.displayName}`);
 
-                } catch (error) {
-                    console.error(`❌ Error processing ${profile.displayName} (ID: ${profile.personId}): ${error.message}`);
-
-                    // If we haven't exhausted retries, throw the error to let Crawlee retry
-                    // Default maxRequestRetries is 3. So retryCount 0, 1, 2.
-                    if (request.retryCount < 3 &&
-                        (error.message.includes('g.preLoad') || error.message.includes('Timeout') || error.message.includes('Extraction failed'))) {
-                        console.log(`🔄 Retrying ${profile.displayName} (Attempt ${request.retryCount + 1}/3)...`);
-                        throw error;
-                    }
-
-                    // Save partial data even on failure (with personId for tracking)
-                    const partialData = {
-                        // Ensure personId is preserved for deduplication
+                    // Save failure record
+                    const failedData = {
                         personId: profile.personId,
                         profileUrl: profile.profileUrl,
-
-                        // Basic info from listing
                         displayName: profile.displayName,
-                        institution: profile.institutionName,
-                        department: profile.departmentName,
-                        facultyRank: profile.facultyRank,
-
-                        // Mark as partial/error
                         error: error.message,
                         isPartial: true,
-
-                        // Metadata
-                        collectedAt: new Date().toISOString(),
-                        query: {
-                            searchKeywords,
-                            department,
-                            institution
-                        }
+                        collectedAt: new Date().toISOString()
                     };
-
-                    await Actor.pushData(partialData);
-                    console.log(`⚠️  Partial data saved: ${profile.displayName} (Retries exhausted)`);
-
-                    // Mark as processed even on error to avoid infinite retry
+                    await Actor.pushData(failedData);
                     stateManager.markProcessed(profile.personId);
-
-                    // Save checkpoint periodically
-                    if (stateManager.shouldCheckpoint()) {
-                        await stateManager.saveCheckpoint();
-                    }
+                    totalProcessed++;
+                    totalErrors++;
                 }
-            },
+            });
 
-            async failedRequestHandler({ request }, error) {
-                console.error(`⚠️  Could not access profile page: ${error.message}`);
-            }
-        });
-
-        // Save search results immediately to prevent data loss on crash
-        await Actor.setValue('SEARCH_DUMP', profiles);
-        console.log(`💾 Saved ${profiles.length} profiles to intermediate storage (SEARCH_DUMP)`);
-
-        // Queue all profile detail pages in batches to prevent event loop blocking
-        console.log('🔄 Adding profiles to request queue...');
-        const BATCH_SIZE = 1000;
-        for (let i = 0; i < profiles.length; i += BATCH_SIZE) {
-            const batch = profiles.slice(i, i + BATCH_SIZE);
-            const requests = batch.map(profile => ({
+            // Add batch profiles to queue
+            const requests = batchProfiles.map(profile => ({
                 url: profile.profileUrl,
                 userData: { profile }
             }));
             await crawler.addRequests(requests);
-            if (i % 5000 === 0 && i > 0) console.log(`   - Queued ${i} / ${profiles.length}`);
+
+            // Run crawler for this batch
+            await crawler.run();
+
+            // Save checkpoint after each batch
+            await stateManager.saveCheckpoint();
+
+            // Memory cleanup between batches
+            console.log(`\n🧹 Batch ${batchIndex + 1} complete. Cleaning up...`);
+            console.log(`   Processed in batch: ${profilesInCurrentBatch}`);
+            console.log(`   Total processed: ${totalProcessed}`);
+
+            // Force garbage collection
+            if (global.gc) {
+                global.gc();
+                console.log('   GC triggered');
+            }
+
+            // Delay between batches (except last batch)
+            if (batchIndex < Math.ceil(remainingProfiles.length / BATCH_SIZE) - 1) {
+                console.log(`   ⏳ Waiting ${DELAY_BETWEEN_BATCHES / 1000}s before next batch...`);
+                await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_BATCHES));
+            }
         }
-        console.log('✅ All profiles queued for processing');
 
-        // Free up memory
-        const profilesCount = profiles.length;
-        profiles = null;
+        // Cleanup OCR worker
+        await terminateWorker();
 
-        // Run the crawler
-        await crawler.run();
-
-        // Wait for data persistence (ensure all pushData buffers are flushed)
-        console.log('\n⏳ Finalizing data persistence...');
-        await new Promise(resolve => setTimeout(resolve, 5000));
-
-        // Summary with detailed dataset verification
+        // Final summary
         const finalDataset = await Actor.openDataset();
         const finalInfo = await finalDataset.getInfo();
         const stats = stateManager.getStats();
 
-        const newItemsCollected = finalInfo.itemCount - preProcessingInfo.itemCount;
-        const processedCount = stats.totalProcessed;
+        console.log(`\n${'═'.repeat(50)}`);
+        console.log(`✅ SCRAPING COMPLETED`);
+        console.log(`${'═'.repeat(50)}`);
+        console.log(`📊 Results:`);
+        console.log(`   - Total profiles found: ${profiles.length}`);
+        console.log(`   - Processed this run: ${totalProcessed}`);
+        console.log(`   - Errors: ${totalErrors}`);
+        console.log(`   - Dataset items: ${finalInfo.itemCount}`);
+        console.log(`   - Success rate: ${((totalProcessed - totalErrors) / totalProcessed * 100).toFixed(1)}%`);
+        console.log(`   - Processing rate: ${stats.ratePerMinute} profiles/min`);
+        console.log(`${'═'.repeat(50)}`);
 
-        console.log(`\n✅ Collection completed!`);
-        console.log(`   📊 Dataset status:`);
-        console.log(`      - Initial items: ${preProcessingInfo.itemCount}`);
-        console.log(`      - Processed: ${processedCount} profiles`);
-        console.log(`      - Successfully saved: ${newItemsCollected} profiles`);
-        console.log(`      - Total items now: ${finalInfo.itemCount}`);
-        
-        // Use profilesCount which was saved before profiles was set to null
-        const safeProfilesCount = profilesCount || 0;
-        console.log(`   🔍 Researchers found: ${safeProfilesCount}`);
-        
-        const successRate = safeProfilesCount > 0 
-            ? Math.round((newItemsCollected / safeProfilesCount) * 100) 
-            : 0;
-        console.log(`   ✨ Success rate: ${successRate}%`);
-        console.log(`   ⏱️  Total processing rate: ${stats.ratePerMinute} profiles/min`);
-
-        // Warning if there's a mismatch
-        if (processedCount !== newItemsCollected) {
-            console.log(`\n⚠️  Note: ${processedCount - newItemsCollected} profiles were processed but not found in final dataset`);
-            console.log(`   This may be due to data validation or deduplication`);
-        }
-
-        console.log(`\n💾 All data has been saved to Apify Dataset`);
-
-        // Clear state after successful completion
+        // Clear state on successful completion
         await stateManager.finalize();
 
         await Actor.exit();
-    } catch (error) {
-        console.error('❌ Critical error occurred:', error.message);
-        console.error('Error details:', error.stack);
 
-        // Report dataset status even on error
+    } catch (error) {
+        console.error('❌ Critical error:', error.message);
+        console.error('Stack:', error.stack);
+
+        // Cleanup
+        await terminateWorker();
+
+        // Report dataset status
         try {
             const errorDataset = await Actor.openDataset();
             const errorInfo = await errorDataset.getInfo();
-            console.log(`\n📊 Dataset status at error: ${errorInfo.itemCount} items saved`);
-            console.log(`💾 All collected data has been preserved in Apify Dataset`);
-        } catch (reportError) {
-            console.error('Unable to report dataset status:', reportError.message);
+            console.log(`\n📊 Dataset preserved: ${errorInfo.itemCount} items`);
+        } catch (e) {
+            // Ignore
         }
 
         await Actor.exit({ exitCode: 1 });

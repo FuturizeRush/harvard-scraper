@@ -1,9 +1,58 @@
 /**
  * OCR module for extracting email from images
- * Uses Tesseract.js for optical character recognition
+ * Uses Tesseract.js with worker pool for memory efficiency
+ *
+ * OPTIMIZATION: Single shared worker to avoid memory leaks from
+ * repeated worker creation/destruction in large-scale scraping
  */
 
 const Tesseract = require('tesseract.js');
+
+// Singleton worker instance
+let sharedWorker = null;
+let workerUsageCount = 0;
+const MAX_WORKER_USAGE = 100; // Recreate worker after 100 uses to prevent memory buildup
+
+/**
+ * Get or create shared Tesseract worker
+ * @returns {Promise<Tesseract.Worker>} Tesseract worker instance
+ */
+async function getWorker() {
+    // Recreate worker if it's been used too many times
+    if (sharedWorker && workerUsageCount >= MAX_WORKER_USAGE) {
+        try {
+            await sharedWorker.terminate();
+        } catch (e) {
+            // Ignore termination errors
+        }
+        sharedWorker = null;
+        workerUsageCount = 0;
+    }
+
+    if (!sharedWorker) {
+        sharedWorker = await Tesseract.createWorker('eng', 1, {
+            logger: () => {}, // Silent logger
+            errorHandler: () => {} // Suppress errors
+        });
+    }
+
+    return sharedWorker;
+}
+
+/**
+ * Terminate the shared worker (call at end of scraping)
+ */
+async function terminateWorker() {
+    if (sharedWorker) {
+        try {
+            await sharedWorker.terminate();
+        } catch (e) {
+            // Ignore
+        }
+        sharedWorker = null;
+        workerUsageCount = 0;
+    }
+}
 
 /**
  * Perform OCR on an email image URL
@@ -13,11 +62,10 @@ const Tesseract = require('tesseract.js');
 async function performOCR(imageUrl) {
     if (!imageUrl) return null;
 
-    let worker;
     try {
         // Fetch the image with timeout
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
 
         const response = await fetch(imageUrl, {
             signal: controller.signal
@@ -30,24 +78,15 @@ async function performOCR(imageUrl) {
         const imageBuffer = await response.arrayBuffer();
 
         // Validate image buffer
-        if (!imageBuffer || imageBuffer.byteLength === 0) {
+        if (!imageBuffer || imageBuffer.byteLength < 100) {
             return null;
         }
 
-        // Check minimum size (at least 100 bytes for a valid image)
-        if (imageBuffer.byteLength < 100) {
-            return null;
-        }
+        // Use shared worker
+        const worker = await getWorker();
+        workerUsageCount++;
 
-        // Create and initialize Tesseract worker with error handler
-        worker = await Tesseract.createWorker('eng', 1, {
-            logger: () => {}, // Silent logger to reduce noise
-            errorHandler: (err) => {
-                // Suppress errors - will be caught in try/catch
-            }
-        });
-
-        // Wrap recognize in a Promise with timeout to catch async errors
+        // Wrap recognize in a Promise with timeout
         const recognizeWithTimeout = () => {
             return Promise.race([
                 worker.recognize(Buffer.from(imageBuffer)),
@@ -57,7 +96,6 @@ async function performOCR(imageUrl) {
             ]);
         };
 
-        // Perform OCR with Tesseract.js
         const { data: { text } } = await recognizeWithTimeout();
 
         // Check if the image contains N/A or similar indicators
@@ -65,68 +103,44 @@ async function performOCR(imageUrl) {
             return null;
         }
 
-        // Clean the OCR text to handle common issues (spaces, character confusion)
+        // Clean the OCR text
         const cleanedText = cleanOCRText(text);
 
-        // Try to extract email from cleaned text
+        // Try to extract email
         const emailPattern = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
         const match = cleanedText.match(emailPattern);
 
         if (match) {
             const email = match[0].toLowerCase().trim();
-
-            // Validate the extracted email
             if (isValidEmail(email)) {
                 return email;
-            } else {
-                return null;
             }
         }
 
         return null;
 
     } catch (error) {
-        // Silently catch all errors including async ones
         return null;
-    } finally {
-        // Always terminate the worker to free resources
-        if (worker) {
-            try {
-                await worker.terminate();
-            } catch (terminateError) {
-                // Silently ignore termination errors
-            }
-        }
     }
 }
 
 /**
  * Clean OCR text to improve email extraction
- * Handles common OCR issues like extra spaces and character confusion
- * Uses context-aware replacements to avoid over-correction
  * @param {string} text - Raw OCR text
  * @returns {string} Cleaned text
  */
 function cleanOCRText(text) {
     if (!text) return '';
 
-    // Step 1: Remove all whitespace (critical for "pogara@bwh. harvard. edu")
+    // Remove all whitespace
     let cleaned = text.replace(/\s+/g, '');
 
-    // Step 2: Context-aware character corrections
-    // Only fix obvious OCR errors in domain/username parts
-
-    // Fix standalone pipe characters that should be lowercase L
+    // Context-aware character corrections
     cleaned = cleaned.replace(/\|/g, 'l');
-
-    // Fix zero that appears at the end of domain parts (e.g., "0rg" → "org")
     cleaned = cleaned.replace(/0rg\b/gi, 'org');
     cleaned = cleaned.replace(/0m\b/gi, 'om');
 
-    // Step 3: Lowercase for consistency
-    cleaned = cleaned.toLowerCase();
-
-    return cleaned.trim();
+    return cleaned.toLowerCase().trim();
 }
 
 /**
@@ -138,11 +152,11 @@ function isNotAvailable(text) {
     if (!text) return false;
 
     const naPatterns = [
-        /^n\/?a$/i,           // N/A, n/a
-        /^not\s*available$/i, // Not Available
-        /^none$/i,            // None
-        /^-+$/,               // ---
-        /^na$/i               // NA
+        /^n\/?a$/i,
+        /^not\s*available$/i,
+        /^none$/i,
+        /^-+$/,
+        /^na$/i
     ];
 
     const cleaned = text.trim().toLowerCase();
@@ -156,20 +170,16 @@ function isNotAvailable(text) {
  */
 function isValidEmail(email) {
     if (!email) return false;
-
-    // Check minimum length
     if (email.length < 5 || email.length > 100) return false;
-
-    // Basic structure check
     if (!email.includes('@') || !email.includes('.')) return false;
 
-    // Regex validation
     const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
     return emailRegex.test(email);
 }
 
 module.exports = {
     performOCR,
+    terminateWorker,
     isValidEmail,
     cleanOCRText,
     isNotAvailable

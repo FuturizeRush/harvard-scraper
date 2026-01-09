@@ -1,12 +1,17 @@
 /**
  * State Manager for resumable large-scale scraping
  * Uses Apify Key-Value Store to persist progress
+ *
+ * OPTIMIZATION v2.0:
+ * - Efficient Set operations
+ * - Reduced memory peak during serialization
+ * - Better checkpoint management
  */
 
 const { Actor: DefaultActor } = require('apify');
 
 const STATE_KEY = 'SCRAPING_STATE';
-const CHECKPOINT_INTERVAL = 50; // Save state every 50 profiles
+const CHECKPOINT_INTERVAL = 25; // Save state every 25 profiles
 
 class StateManager {
     constructor(Actor = null) {
@@ -23,21 +28,34 @@ class StateManager {
     }
 
     /**
-     * Initialize state (always start fresh)
+     * Initialize state (check for existing state to resume)
      */
     async initialize(searchParams, maxItems) {
         console.log('🔄 Initializing state manager...');
 
-        // Always clear any existing state to ensure independent runs
-        await this._clearState();
+        const savedState = await this.Actor.getValue(STATE_KEY);
 
-        // Initialize new state
+        if (this._canResume(savedState, searchParams)) {
+            console.log('♻️  Resuming from saved state...');
+            this.state = {
+                processedPersonIds: new Set(savedState.processedIds || []),
+                totalProcessed: savedState.totalProcessed || 0,
+                totalRequested: maxItems,
+                startedAt: savedState.startedAt,
+                lastCheckpointAt: savedState.lastCheckpointAt,
+                searchParams: savedState.searchParams,
+                isResumed: true
+            };
+            console.log(`   Already processed: ${this.state.totalProcessed} profiles`);
+            return true;
+        }
+
+        await this._clearState();
         this.state.startedAt = new Date().toISOString();
         this.state.searchParams = searchParams;
         this.state.totalRequested = maxItems;
-
         console.log('🆕 Starting new scraping session');
-        return false; // Always indicates new run
+        return false;
     }
 
     /**
@@ -52,6 +70,13 @@ class StateManager {
             saved.department === currentParams.department &&
             saved.institution === currentParams.institution
         );
+    }
+
+    /**
+     * Get processed IDs as Set (for filtering)
+     */
+    getProcessedIds() {
+        return new Set(this.state.processedPersonIds);
     }
 
     /**
@@ -84,32 +109,38 @@ class StateManager {
     }
 
     /**
-     * Save current state to KV store and report dataset status
+     * Save current state to KV store
+     * Optimized to reduce memory peak during serialization
      */
     async saveCheckpoint() {
         this.state.lastCheckpointAt = new Date().toISOString();
 
+        // Convert Set to Array efficiently (avoid creating intermediate objects)
+        const processedIdsArray = Array.from(this.state.processedPersonIds);
+
         const stateToSave = {
-            ...this.state,
-            processedPersonIds: Array.from(this.state.processedPersonIds)
+            processedIds: processedIdsArray,
+            totalProcessed: this.state.totalProcessed,
+            totalRequested: this.state.totalRequested,
+            startedAt: this.state.startedAt,
+            lastCheckpointAt: this.state.lastCheckpointAt,
+            searchParams: this.state.searchParams,
+            checkpointCount: (this.state.checkpointCount || 0) + 1
         };
 
         await this.Actor.setValue(STATE_KEY, stateToSave);
 
         const elapsed = this._getElapsedTime();
-        const remaining = this.getRemainingCount();
-        const rate = this.state.totalProcessed / (elapsed / 60); // profiles per minute
-        const estimatedRemaining = remaining / rate; // minutes
+        const rate = this.state.totalProcessed / (elapsed / 60);
 
-        // Get dataset info to confirm data is saved
+        // Get dataset info
         const dataset = await this.Actor.openDataset();
         const datasetInfo = await dataset.getInfo();
 
         console.log('💾 Checkpoint saved');
         console.log(`   Progress: ${this.state.totalProcessed}/${this.state.totalRequested} (${this._getProgressPercentage()}%)`);
-        console.log(`   ✅ Dataset items: ${datasetInfo.itemCount} profiles saved`);
+        console.log(`   Dataset: ${datasetInfo.itemCount} items`);
         console.log(`   Rate: ${rate.toFixed(1)} profiles/min`);
-        console.log(`   Estimated time remaining: ${Math.round(estimatedRemaining)} minutes`);
     }
 
     /**
@@ -124,7 +155,8 @@ class StateManager {
             startedAt: null,
             lastCheckpointAt: null,
             searchParams: null,
-            isResumed: false
+            isResumed: false,
+            checkpointCount: 0
         };
     }
 
@@ -148,8 +180,8 @@ class StateManager {
      * Get elapsed time in seconds
      */
     _getElapsedTime() {
-        if (!this.state.startedAt) return 0;
-        return (new Date() - new Date(this.state.startedAt)) / 1000;
+        if (!this.state.startedAt) return 1; // Avoid division by zero
+        return Math.max(1, (new Date() - new Date(this.state.startedAt)) / 1000);
     }
 
     /**
@@ -158,7 +190,7 @@ class StateManager {
     getStats() {
         const elapsed = this._getElapsedTime();
         const remaining = this.getRemainingCount();
-        const rate = this.state.totalProcessed / (elapsed / 60); // profiles per minute
+        const rate = this.state.totalProcessed / (elapsed / 60);
 
         return {
             totalProcessed: this.state.totalProcessed,

@@ -35,7 +35,7 @@
             "editor": "number",
             "default": 50,
             "minimum": 50,
-            "maximum": 30000,
+            "maximum": 1000000,
             "prefill": 50
         }
     },

@@ -34,6 +34,7 @@ async function searchProfiles({ keyword, department, institution, maxItems }) {
     let offset = 1;
     let totalAvailable = null;
     let emptyPagesCount = 0;
+    let consecutiveFailures = 0;
     const MAX_EMPTY_PAGES = 5; // Stop after 5 consecutive empty pages
 
     // Sanitize all user inputs
@@ -63,25 +64,38 @@ async function searchProfiles({ keyword, department, institution, maxItems }) {
                 Offset: offset
             };
 
-            // Make API request with retry logic
+            // Make API request with retry logic (5 attempts)
             const data = await withRetry(async () => {
-                const response = await fetch(SEARCH_ENDPOINT, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Accept': 'application/json',
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'User-Agent': 'Mozilla/5.0'
-                    },
-                    body: JSON.stringify(payload)
-                });
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
 
-                if (!response.ok) {
-                    throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+                try {
+                    const response = await fetch(SEARCH_ENDPOINT, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'User-Agent': 'Mozilla/5.0'
+                        },
+                        body: JSON.stringify(payload),
+                        signal: controller.signal
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+                    }
+
+                    // Handle JSON parse errors specifically
+                    try {
+                        return await response.json();
+                    } catch (parseError) {
+                        throw new Error(`Invalid JSON response: ${parseError.message}`);
+                    }
+                } finally {
+                    clearTimeout(timeoutId);
                 }
-
-                return await response.json();
-            });
+            }, 5);
 
             // Track total available from first response
             if (totalAvailable === null && data.Count) {
@@ -133,6 +147,9 @@ async function searchProfiles({ keyword, department, institution, maxItems }) {
                 profiles.push(profile);
             }
 
+            // Reset failure counter on success
+            consecutiveFailures = 0;
+
             // Check if we've reached maxItems
             if (profiles.length >= maxItems) {
                 console.log(`✅ Reached requested maximum: ${profiles.length} profiles`);
@@ -145,8 +162,21 @@ async function searchProfiles({ keyword, department, institution, maxItems }) {
             await new Promise(resolve => setTimeout(resolve, 200));
 
         } catch (error) {
-            console.error(`⚠️  Search temporarily unavailable: ${error.message}`);
-            break;
+            console.error(`⚠️  Failed to fetch page at offset ${offset}: ${error.message}`);
+
+            // Skip this page and continue to avoid losing all progress
+            offset += pageSize;
+            consecutiveFailures++;
+
+            // Stop if too many consecutive errors (likely blocked or server down)
+            if (consecutiveFailures > 20) {
+                console.error('❌ Too many consecutive API failures (20). Stopping search to prevent infinite loop.');
+                break;
+            }
+
+            console.log(`⏭️  Skipping failed page, moving to offset ${offset}...`);
+            // Longer wait after failure
+            await new Promise(resolve => setTimeout(resolve, 5000));
         }
     }
 
@@ -180,5 +210,6 @@ async function withRetry(fn, maxRetries = 3) {
 }
 
 module.exports = {
-    searchProfiles
+    searchProfiles,
+    sanitizeInput
 };
