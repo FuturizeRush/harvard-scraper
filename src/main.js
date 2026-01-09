@@ -64,7 +64,7 @@ const { StateManager } = require('./lib/state-manager.js');
         console.log(`📊 Dataset before processing: ${preProcessingInfo.itemCount} items`);
 
         const crawler = new PlaywrightCrawler({
-            maxConcurrency: 5,
+            maxConcurrency: 1,
             launchContext: {
                 launchOptions: {
                     headless: true
@@ -77,6 +77,15 @@ const { StateManager } = require('./lib/state-manager.js');
             },
             requestHandlerTimeoutSecs: 90,
             navigationTimeoutSecs: 60,
+            
+            preNavigationHooks: [
+                async ({ page, log }) => {
+                    // Anti-blocking: Random delay between requests (2-5 seconds)
+                    const delay = Math.floor(Math.random() * 3000) + 2000;
+                    log.info(`💤 Sleeping for ${delay}ms to avoid blocking...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            ],
 
             async requestHandler({ request, page }) {
                 const { profile } = request.userData;
